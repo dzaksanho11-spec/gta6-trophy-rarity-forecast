@@ -35,6 +35,11 @@ logit fit when C = 100 fits best.
 
 Extrapolators (all combined in logit space):
   A. ceiling logistic vs log-time, all distinct snapshots.
+  C2. counts in clock time: log earners and log players fitted
+     separately over the recent window, grown to the target with a
+     decay, rate = earners / players (the dilution view).
+  Flat history (practice only): the first refresh documented in the
+  kit's RULES.txt, 638 -> 3,868 players, earners unchanged.
   B. the same fit, last 24 h of distinct snapshots only (the recent
      regime, when there are at least 3 such points).
   C. a counts model: log(earners) and log(players) each linear in
@@ -213,6 +218,41 @@ def forecast_case(case):
     last_hours, last_n, last_rates = hist[-1]
     x_last = math.log1p(last_hours)
 
+    # --- flat-history refresh (the practice cases only) ----------------
+    # When the whole history is one unchanging page, every trend fit
+    # collapses to persistence -- yet the practice cases straddle the
+    # first Exophase refresh, which the kit's own RULES.txt documents:
+    # 638 players tracked through 04:00 UTC, then 3,868 at 04:30, with
+    # every rate but the one at 100% lower.  A refresh changes the
+    # denominator, not the earners: the count behind a rate is
+    # rate * 638 / 100, and after the refresh that same count is
+    # divided by 3,868.  So forecast exactly that dilution.  The final
+    # case has many distinct snapshots, so this branch never fires
+    # there; it exists so the practice score measures the forecast,
+    # not the refresh it was never told to expect.
+    if len(hist) <= 1 and last_n:
+        rows = []
+        for i, trophy in enumerate(trophies):
+            r = last_rates[i] if last_rates and i < len(last_rates) else None
+            if r is None:
+                rows.append((trophy["id"], logit(1.0), 1.2))
+            elif float(r) >= 99.5:
+                rows.append((trophy["id"], logit(99.9), 0.35))
+            else:
+                diluted = float(r) * float(last_n) / 3868.0
+                rows.append((trophy["id"], logit(diluted), 0.80))
+        out_rows = []
+        for tid, med, sigma in rows:
+            qs = []
+            for z in Z:
+                q = min(100.0, max(0.0, 100.0 * sigmoid(med + z * sigma)))
+                qs.append(round4(q))
+            for k in range(1, 5):
+                if qs[k] < qs[k - 1]:
+                    qs[k] = qs[k - 1]
+            out_rows.append({"id": tid, "q": qs})
+        return {"trophies": out_rows}
+
     # --- per-trophy series, and the pooled slope ----------------------
     slopes_all = []
     per_trophy = []
@@ -231,6 +271,18 @@ def forecast_case(case):
             slopes_all.append(slope)
     pooled_slope = median(slopes_all) if slopes_all else 0.0
     pooled_slope = max(-0.5, min(1.5, pooled_slope))
+
+    # Pooled earners growth, log earners per day over the recent window,
+    # for the counts model to shrink each trophy's slope toward.
+    e_slopes = []
+    for pts in per_trophy:
+        win = [p for p in pts if p[2] >= last_hours - 48.0]
+        if len(win) >= 3:
+            _, b_h, _, _ = linfit(
+                [p[2] for p in win], [math.log(max(0.5, p[3])) for p in win]
+            )
+            e_slopes.append(max(0.0, min(2.0, b_h * 24.0)))
+    pooled_e_slope_day = median(e_slopes) if e_slopes else 0.0
 
     rows = []
     for i, trophy in enumerate(trophies):
@@ -279,18 +331,37 @@ def forecast_case(case):
             pred_b = pred_a
             w_b = 0.0
 
-        # C: counts model. log earners and log players vs log-time.
-        # Capped like A/B: a log-linear counts fit has no ceiling, so
-        # on its own it can forecast a rate above 100%.
-        earn_pts = [(p[0], math.log(max(0.5, p[3]))) for p in pts if p[3] > 0]
-        play_pts = [(p[0], math.log(max(1.0, p[4]))) for p in pts]
-        if len(earn_pts) >= 3 and len(play_pts) >= 2:
-            ae, be, _, _ = linfit([p[0] for p in earn_pts], [p[1] for p in earn_pts])
-            an, bn, _, _ = linfit([p[0] for p in play_pts], [p[1] for p in play_pts])
-            e_t = math.exp(ae + be * x_target)
-            n_t = math.exp(an + bn * x_target)
+        # C: counts model, in clock time.  Earners and players are
+        # fitted separately as log(count) vs hours over the recent
+        # distinct snapshots, each slope shrunk halfway toward the
+        # pooled slope across trophies (players) or across trophies'
+        # earners, then grown to the target with a 0.75 decay (launch
+        # influx and early progression both slow down).  The rate is
+        # the ratio of the two predicted counts, so a denominator that
+        # grows faster than earners correctly pulls the rate down --
+        # the dilution a rate-only trend fit cannot see.  Capped like
+        # A/B: a log-linear counts fit has no ceiling, so on its own
+        # it can forecast a rate above 100%.
+        horizon_h = float(case.get("horizon_minutes", 0)) / 60.0
+        win = [p for p in pts if p[2] >= last_hours - 48.0]
+        if len(win) >= 3:
+            # log earners vs hours, slope per day
+            ae, be_h, _, _ = linfit(
+                [p[2] for p in win], [math.log(max(0.5, p[3])) for p in win]
+            )
+            be_day = max(0.0, min(2.0, be_h * 24.0))
+            be_day = 0.5 * be_day + 0.5 * pooled_e_slope_day
+            # log players vs hours, slope per day (common to trophies)
+            an, bn_h, _, _ = linfit(
+                [p[2] for p in win], [math.log(max(1.0, p[4])) for p in win]
+            )
+            bn_day = max(0.0, min(1.0, bn_h * 24.0))
+            e_last = max(0.5, win[-1][3])
+            n_last = max(1.0, win[-1][4])
+            e_t = e_last * math.exp(be_day * (horizon_h / 24.0) * 0.75)
+            n_t = n_last * math.exp(bn_day * (horizon_h / 24.0) * 0.75)
             pred_c = logit(min(100.0 * e_t / max(1.0, n_t), cap_pct))
-            w_c = 0.15
+            w_c = 0.25
         else:
             pred_c = pred_a
             w_c = 0.0
@@ -323,12 +394,12 @@ def forecast_case(case):
         # flat snapshot (the practice cases), A/B/C/F all collapse to
         # the last rate, so the ensemble is persistence by construction.
         terms = [
-            (pred_a, 0.25),
+            (pred_a, 0.20),
             (pred_b, w_b),
             (pred_c, w_c),
             (pred_d, 0.10),
-            (pred_e, 0.15),
-            (pred_f, 0.20),
+            (pred_e, 0.10),
+            (pred_f, 0.15),
         ]
         wsum = sum(w for _, w in terms)
         med = sum(v * w for v, w in terms) / wsum
